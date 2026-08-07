@@ -318,6 +318,50 @@ REDIS_DB=0
 
 ---
 
+## Health Endpoints
+
+Chen Pilot exposes two operations-facing probes with different purposes:
+
+- `GET /health` is a liveness probe. It returns HTTP `200` with a lightweight
+  `{ status, timestamp }` payload while the process is up.
+- `GET /ready` is a readiness probe. It returns a full dependency report and
+  uses HTTP `503` when a critical dependency is down.
+
+The current readiness report includes:
+
+- `database`
+- `redis`
+- `horizon`
+- `sorobanRpc`
+- `email`
+- `llm`
+
+Each dependency includes `status`, `latencyMs`, and optional `error` or
+`detail` fields. `database` and `redis` are treated as critical. Redis and
+Soroban RPC connectivity are therefore visible directly in the readiness
+payload, rather than being collapsed into a single boolean.
+
+For contributor-facing operational detail, see
+`docs/SYSTEMS_HANDBOOK.md#health-and-readiness-endpoints`.
+
+## Rate Limiting In Multi-Instance Deployments
+
+Gateway rate limiting is configured in
+`src/Gateway/middleware/rateLimiter.service.ts`.
+
+- The primary `express-rate-limit` store is Redis-backed via `rate-limit-redis`
+  and `getRedisClient()`.
+- This allows request counters to be shared across multiple API instances when
+  they point at the same Redis deployment.
+- If Redis-backed limiter creation fails, the service currently falls back to
+  the default in-memory store. That keeps one node serving traffic, but it no
+  longer enforces a shared limit across a horizontally scaled fleet.
+
+Operators should treat the in-memory fallback as a degraded mode and restore
+Redis connectivity before relying on cluster-wide request ceilings.
+
+---
+
 ## Contributing
 
 - Fork the repository
@@ -340,7 +384,7 @@ This project is licensed under the ISC License.
 For technical support and community inquiries:
 
 - Create an issue in the repository
-- Monitor the API health and status endpoints
+- Monitor `/health` for liveness and `/ready` for dependency-level readiness
 - Review the logs for error details
 
 ---
