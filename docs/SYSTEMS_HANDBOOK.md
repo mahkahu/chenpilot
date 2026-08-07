@@ -105,6 +105,102 @@ Planner execution is intentionally conservative for safety. When a plan step fai
 
 This behavior is the current contract for multi-step agent flows and should be preserved unless a follow-up design introduces explicit rollback/compensation support.
 
+## Health And Readiness Endpoints
+
+Operational health is split across two endpoints in `src/Gateway/api.ts`:
+
+- `GET /health` is the liveness probe. It always returns HTTP `200` while the
+  process is running and responds with a lightweight payload:
+
+```json
+{
+  "status": "UP",
+  "timestamp": "2026-07-30T12:00:00.000Z"
+}
+```
+
+- `GET /ready` is the readiness probe. It calls `HealthService.getFullReport()`
+  and returns dependency-level status for the current node.
+
+`/ready` returns HTTP `200` when the service is `HEALTHY` or `DEGRADED`, and
+HTTP `503` when the service is `UNHEALTHY`.
+
+Current dependency checks in `src/services/healthService.ts`:
+
+- `database`: runs `SELECT 1` against the initialized TypeORM datasource.
+- `redis`: creates a Redis client and verifies connectivity with `PING`.
+- `horizon`: queries the latest Horizon ledger.
+- `sorobanRpc`: queries the latest Soroban RPC ledger using
+  `SOROBAN_RPC_URL` when set, or the configured network default.
+- `email`: verifies the configured SMTP transport when email is enabled.
+- `llm`: performs local API key validation without issuing an external request.
+
+Each dependency entry includes:
+
+- `status`: `UP`, `DEGRADED`, or `DOWN`
+- `latencyMs`: rounded check duration in milliseconds
+- `error`: failure reason when a check degrades or fails
+- `detail`: optional metadata such as ledger sequence
+
+Overall readiness rules:
+
+- `database` and `redis` are critical. If either is `DOWN`, the report becomes
+  `UNHEALTHY` and `/ready` returns `503`.
+- Non-critical failures such as Horizon, Soroban RPC, email, or LLM validation
+  produce a `DEGRADED` report while keeping the process ready for traffic.
+
+Example `/ready` response shape:
+
+```json
+{
+  "overallStatus": "DEGRADED",
+  "timestamp": "2026-07-30T12:00:00.000Z",
+  "uptime": 1234,
+  "dependencies": {
+    "database": { "status": "UP", "latencyMs": 4 },
+    "redis": { "status": "UP", "latencyMs": 2 },
+    "horizon": { "status": "UP", "latencyMs": 180, "detail": { "ledgerSequence": 123 } },
+    "sorobanRpc": { "status": "DOWN", "latencyMs": 3000, "error": "request timed out" },
+    "email": { "status": "DEGRADED", "latencyMs": 0, "error": "Email not configured" },
+    "llm": { "status": "UP", "latencyMs": 0 }
+  }
+}
+```
+
+Operational guidance:
+
+- Use `/health` for container liveness probes.
+- Use `/ready` for load balancer readiness checks and incident triage.
+- When investigating Soroban RPC problems, prefer the per-dependency
+  `sorobanRpc.error` field over a single top-level boolean.
+- When investigating Redis outages, treat `/ready = 503` as a hard signal that
+  both distributed locking and shared rate limiting may be impaired.
+
+## Gateway Rate Limiting
+
+Gateway rate limiting is implemented in
+`src/Gateway/middleware/rateLimiter.service.ts`.
+
+The current implementation already uses a shared Redis-backed
+`express-rate-limit` store:
+
+- `rate-limit-redis` is used as the primary store
+- the store is backed by `getRedisClient()`
+- health and readiness probes are skipped from rate limiting
+
+Deployment implications:
+
+- All horizontally scaled API instances must point at the same Redis cluster if
+  the configured request ceilings are expected to apply globally.
+- The limiter currently falls back to the default in-memory store when Redis
+  store construction fails. That preserves availability for a single process,
+  but it removes shared counters across instances.
+- Production operators should alert on the
+  `Error creating Redis rate limiter, falling back to memory store` log message.
+- Multi-instance deployments should treat that fallback as a degraded
+  operational mode and restore Redis connectivity before relying on the
+  configured rate ceilings.
+
 ## Migrations
 
 Database migrations live under `src/migrations` and use timestamp-prefixed
